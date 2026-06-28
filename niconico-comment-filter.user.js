@@ -12,6 +12,8 @@
 // @connect      api.anthropic.com
 // @connect      generativelanguage.googleapis.com
 // @connect      api.openai.com
+// @updateURL    https://github.com/106-/niconikolai-yezhov/raw/refs/heads/main/niconico-comment-filter.user.js
+// @downloadURL  https://github.com/106-/niconikolai-yezhov/raw/refs/heads/main/niconico-comment-filter.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -20,7 +22,7 @@
 
   const MODEL_STORAGE = 'nicofilter_model';
   const USAGE_STORAGE = 'nicofilter_usage';
-  const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+  const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
   const PROVIDERS = {
     anthropic: { keyStorage: 'nicofilter_apikey_anthropic' },

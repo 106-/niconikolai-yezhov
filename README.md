@@ -32,7 +32,7 @@ AI人民委員がコメント欄の治安を守り、不適切なコメントを
 ## インストール
 
 1. [Tampermonkey](https://www.tampermonkey.net/) をブラウザにインストール
-2. `niconico-comment-filter.user.js` を Tampermonkey に追加
+2. **[ニコニコライエジョフをインストール](https://github.com/106-/niconikolai-yezhov/raw/refs/heads/main/niconico-comment-filter.user.js)** をクリック（Tampermonkey が自動でインストールダイアログを表示します）
 3. 利用したいプロバイダーの API キーを取得:
    - [Anthropic](https://console.anthropic.com/)
    - [Google AI Studio](https://aistudio.google.com/)
