@@ -87,7 +87,7 @@ niconico-comment-filter.user.js     ユーザースクリプト本体
 niconico-comment-internals.md       プレイヤー内部構造の解析ドキュメント
 niconico-design-tokens.md           ニコニコ動画のデザインシステム (カラートークン)
 architecture.md                     設計と実装の解説
-presentation.md                     プレゼンテーション資料
+ニコニコ動画人民委員ニコニコライエジョフ.pdf  プレゼンテーション資料
 replace-comments.js                 コンソール用コメント置換スクリプト (検証用)
 replace-comments-oneliner.js        同上のワンライナー版
 ```
