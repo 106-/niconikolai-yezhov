@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ニコニコライエジョフ
 // @namespace    https://github.com/106-
-// @version      0.2.0
+// @version      0.3.4
 // @description  Anthropic / Gemini / OpenAI API でニコニコ動画のコメントをAIフィルターする
 // @match        https://www.nicovideo.jp/watch/*
 // @match        https://nicovideo.jp/watch/*
@@ -91,18 +91,24 @@
     return GM_getValue(USAGE_STORAGE, { totalInput: 0, totalOutput: 0, totalCostUSD: 0, history: [] });
   }
 
-  function recordUsage(model, inputTokens, outputTokens) {
+  function recordUsage(model, u) {
     const m = MODELS.find(x => x.id === model) || MODELS[0];
-    const costUSD = (inputTokens / 1e6) * m.inputPer1M + (outputTokens / 1e6) * m.outputPer1M;
+    const input = u.input_tokens || 0;
+    const output = u.output_tokens || 0;
+    // Anthropic のプロンプトキャッシュ: 書き込みは 1.25 倍、読み出しは 0.1 倍で課金される
+    const cacheWrite = u.cache_creation_input_tokens || 0;
+    const cacheRead = u.cache_read_input_tokens || 0;
+    const inputTokens = input + cacheWrite + cacheRead;
+    const costUSD = ((input + cacheWrite * 1.25 + cacheRead * 0.1) / 1e6) * m.inputPer1M + (output / 1e6) * m.outputPer1M;
     const usage = loadUsage();
     usage.totalInput += inputTokens;
-    usage.totalOutput += outputTokens;
+    usage.totalOutput += output;
     usage.totalCostUSD += costUSD;
     const videoId = location.pathname.match(/watch\/([a-z]{2}\d+)/)?.[1] || '';
-    usage.history.push({ date: new Date().toISOString(), model: m.label, videoId, inputTokens, outputTokens, costUSD });
+    usage.history.push({ date: new Date().toISOString(), model: m.label, videoId, inputTokens, outputTokens: output, costUSD });
     if (usage.history.length > 200) usage.history = usage.history.slice(-200);
     GM_setValue(USAGE_STORAGE, usage);
-    return { inputTokens, outputTokens, costUSD };
+    return { inputTokens, outputTokens: output, costUSD };
   }
 
   // ========== Fiber 走査 ==========
@@ -195,14 +201,14 @@
   const TOOLS = [
     {
       name: 'hide_comments',
-      description: '指定されたIDのコメントを非表示にする。荒らし、不快、ネタバレなど非表示にすべきコメントのIDを指定する。',
+      description: '指定された番号のコメントを非表示にする。荒らし、不快、ネタバレなど非表示にすべきコメントの番号を指定する。',
       input_schema: {
         type: 'object',
         properties: {
           ids: {
             type: 'array',
             items: { type: 'string' },
-            description: '非表示にするコメントのIDリスト'
+            description: '非表示にするコメント番号のリスト（例: ["12", "34"]）'
           }
         },
         required: ['ids']
@@ -210,7 +216,7 @@
     },
     {
       name: 'replace_comments',
-      description: '指定されたIDのコメントの本文を書き換える。翻訳、検閲、修正などに使う。',
+      description: '指定された番号のコメントの本文を書き換える。翻訳、検閲、修正などに使う。',
       input_schema: {
         type: 'object',
         properties: {
@@ -219,7 +225,7 @@
             items: {
               type: 'object',
               properties: {
-                id: { type: 'string', description: 'コメントID' },
+                id: { type: 'string', description: 'コメント番号（例: "12"）' },
                 new_body: { type: 'string', description: '置換後の本文' }
               },
               required: ['id', 'new_body']
@@ -232,14 +238,14 @@
     },
     {
       name: 'hide_user',
-      description: '指定されたユーザーIDのコメントをすべて非表示にする。特定ユーザーの荒らし行為など、ユーザー単位でまとめて粛清したい場合に使う。',
+      description: '指定されたユーザータグのコメントをすべて非表示にする。特定ユーザーの荒らし行為など、ユーザー単位でまとめて粛清したい場合に使う。',
       input_schema: {
         type: 'object',
         properties: {
           user_ids: {
             type: 'array',
             items: { type: 'string' },
-            description: '非表示にするユーザーIDのリスト'
+            description: '非表示にするユーザータグのリスト（例: ["u3"]）'
           }
         },
         required: ['user_ids']
@@ -247,11 +253,121 @@
     }
   ];
 
-  function callAnthropic(apiKey, messages, tools, system) {
+  // ========== AIフィルター分類 ==========
+
+  const FILTER_CATEGORIES = [
+    { key: 'discrimination', label: '差別・ヘイト' },
+    { key: 'harassment',     label: '暴言・誹謗中傷' },
+    { key: 'flamewar',       label: 'レスバ・対立煽り' },
+    { key: 'spoiler',        label: 'ネタバレ' },
+    { key: 'spam',           label: 'スパム・宣伝' },
+  ];
+
+  const CLASSIFY_CHUNK_SIZE = 200;
+  const CLASSIFY_CONCURRENCY = 8;
+
+  const CLASSIFY_TOOL = {
+    name: 'classify_comments',
+    description: '問題のあるコメントの番号をカテゴリ別に報告する。問題のないコメントは含めない。該当がないカテゴリは空配列にする。',
+    strict: true,
+    input_schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        discrimination: { type: 'array', items: { type: 'integer' }, description: '差別・ヘイトに該当するコメント番号' },
+        harassment:     { type: 'array', items: { type: 'integer' }, description: '暴言・誹謗中傷に該当するコメント番号' },
+        flamewar:       { type: 'array', items: { type: 'integer' }, description: 'レスバ・対立煽りに該当するコメント番号' },
+        spoiler:        { type: 'array', items: { type: 'integer' }, description: 'ネタバレに該当するコメント番号' },
+        spam:           { type: 'array', items: { type: 'integer' }, description: 'スパム・宣伝に該当するコメント番号' }
+      },
+      required: ['discrimination', 'harassment', 'flamewar', 'spoiler', 'spam']
+    }
+  };
+
+  const FILTER_SYSTEM_PROMPT = `あなたはニコニコ動画のコメント分類器。動画情報とコメント一覧（各行「#番号<TAB>本文」）を受け取り、classify_comments ツールで問題のあるコメントの番号を報告する。
+
+## 出力ルール
+- 全コメントを1件ずつ読み、問題のあるコメントの番号だけをカテゴリ別に報告する。問題のないコメント（ok）は出力しない。
+- 判断に迷ったら報告しない（ok 扱い）。明確に該当する場合のみ報告する。
+- 複数カテゴリに該当する場合は discrimination > harassment > flamewar > spoiler > spam の優先順で1つだけに入れる。
+- 説明文は書かない。ツールコールだけを行う。
+
+## ニコニコ文化の保護（常に ok とするもの）
+- 弾幕・お約束コメント（「！？」「だろうな」「草」「8888」「wwww」など、シリーズ固有の定型ネタを含む）
+- 空耳・ネタコメント・コメントアート
+- 動画の内容への通常の感想・考察・突っ込み（「機長無能すぎる」のような内容への批判も ok）
+- 動画の主題に関わる文化・国民性・組織体質の議論は、蔑称や属性への侮辱的一般化を含まない限り、批判的な内容でも ok
+
+## 判定の考え方
+「何について言っているか」で切り分ける。動画で扱われる事故・組織・文化的背景そのものへの言及は、辛辣でも ok。
+「その属性を持つ人間全体」への蔑称・侮辱・デマ、および「他の視聴者」への攻撃が非表示の対象。
+同じ単語（国名・民族名）を含んでいても、この区別で判定が変わることに注意する。
+
+## カテゴリ定義と判定例
+
+### discrimination — 差別・ヘイト
+民族・国籍・人種・性別など属性への蔑称、属性全体への侮辱的一般化、属性を標的にしたデマ。
+非表示にする例:
+- 「だって韓国人だもの」（事故原因を民族性に帰す侮辱的一般化）
+- 「この人種はプロ意識なんて皆無だからなｗ見栄をはって終わりｗ」
+- 「計器の中からキムチが出てきました」（民族揶揄のネタ化）
+- 「チョンは引継ぎしない、チョン産ネトゲみてりゃ分かるね」（蔑称＋一般化）
+- 「結論：韓国はクソ」（国・民族全体への侮辱）
+- 「流石韓国人ホントに期待を裏切らないなw」（属性への揶揄的一般化）
+- 「大韓航空が出てくる度にこうやって在日ヒトモドキの皆さんが暴れるのか……」（蔑称＋レッテル貼り）
+- 「本場キムチを食うと脳味噌を食う寄生虫に寄生されるのを、知ってるか？」（属性を標的にした侮蔑的デマ）
+- 蔑称（「チョン」「ヒトモドキ」「土人」「ジャップ」等）を含むもの全般
+ok とする例（境界）:
+- 「韓国と日本の上下関係は異常だよな　「上は全て正しい」」→ ok（動画主題である文化的要因の議論）
+- 「民族、国民の感情も航空事故調査には密接な関係がある」→ ok（冷静な考察）
+- 「韓国の航空会社の話なんだからコメに韓国が溢れるのは当然では？」→ ok（冷静なメタ言及）
+- 「悪質機長は別に韓国には限らないわな」→ ok（一般化への反論）
+- 「儒教圏（中国・北朝鮮・韓国）」→ ok（事実の言及）
+
+### harassment — 暴言・誹謗中傷
+特定の人物への強い罵倒・中傷（「死ね」「ゴミカス」等の強い暴言、執拗な攻撃）。
+ok とする例（境界）: 「機長無能すぎる」「バカねぇ…」のような動画内容への軽い突っ込み → ok
+
+### flamewar — レスバ・対立煽り
+他の視聴者コメントへの攻撃、コメント欄での論争の応酬、政治的レッテル貼り。
+非表示にする例:
+- 「↓黙れ朝鮮人」
+- 「↑やっぱり朝鮮人ってバカなんだな、お前のことだぞ」
+- 「お前の目は節穴か？」（他コメントへの攻撃）
+- 「韓国批判＝右翼というバカ　…とか頭大丈夫か？」（レッテル貼り＋攻撃）
+- 「↑他の国の航空会社ではこんなに出てこねえよ、お前らの言う韓国人とやってること変わらねえじゃん」（応酬の継続）
+- 「動画を見れば韓国が馬鹿だって事が分かる。コメを見れば日本人が馬鹿だって事が分かる。」（コメント欄全体への煽り）
+ok とする例（境界）:
+- 「↑」「↓」で他コメントに冷静に反論・補足するもの → ok
+- 「韓国関連でなぜか荒れているから。」→ ok（状況の説明）
+
+### spoiler — ネタバレ
+動画内でまだ明かされていない結末・犯人・原因を具体的に先バラしするもの。
+非表示にする例: 序盤の時点で「この事故の原因は◯◯」「犯人は◯◯」と結末を明かすもの
+ok とする例（境界）:
+- シリーズ定番の予告的・様式的コメント（「メーデー民ならここでもう「は！？」ってなるやつ」等）→ ok
+- その時点で動画内に既出の情報への言及 → ok
+
+### spam — スパム・宣伝
+動画と無関係な宣伝・誘導・チャンネル誘導、意味のない文字列の連投。
+ok とする例（境界）: 「回転！」「FND!」「真水につけろ」「8888」のような弾幕・シリーズお約束の繰り返しは spam ではなく ok`;
+
+  function callAnthropic(apiKey, messages, tools, system, opts = {}) {
     const model = loadModel();
-    const body = { model, max_tokens: 4096, messages };
+    const body = { model, max_tokens: opts.maxTokens ?? 4096, messages };
     if (tools) body.tools = tools;
-    if (system) body.system = system;
+    if (system) {
+      // cacheSystem: ツール定義+システムプロンプト（安定プレフィックス）をキャッシュする。
+      // Sonnet 4.6 の最低キャッシュ長は 2048 トークンなので、プレフィックスはそれ以上に保つこと
+      body.system = opts.cacheSystem
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system;
+    }
+    // cacheConversation: 最後のキャッシュ可能ブロックに自動配置（会話履歴全体をキャッシュ）
+    if (opts.cacheConversation) body.cache_control = { type: 'ephemeral' };
+    if (opts.toolChoice) body.tool_choice = { type: 'tool', name: opts.toolChoice };
+    // 分類の決定性向上用。現行の 4.6 系モデルは temperature を受け付ける
+    if (opts.temperature !== undefined) body.temperature = opts.temperature;
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -259,6 +375,9 @@
         headers: {
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
+          // ブラウザ発（Origin ヘッダー付き）のリクエストに Anthropic が要求するオプトイン。
+          // API キーがクライアント側にあることを了解した上での利用（本スクリプトの前提どおり）
+          'anthropic-dangerous-direct-browser-access': 'true',
           'content-type': 'application/json'
         },
         data: JSON.stringify(body),
@@ -312,12 +431,25 @@
     return contents;
   }
 
+  function stripUnsupportedSchemaKeys(schema) {
+    if (Array.isArray(schema)) return schema.map(stripUnsupportedSchemaKeys);
+    if (schema && typeof schema === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(schema)) {
+        if (k === 'additionalProperties') continue;
+        out[k] = stripUnsupportedSchemaKeys(v);
+      }
+      return out;
+    }
+    return schema;
+  }
+
   function convertToolsForGemini(tools) {
     if (!tools || tools.length === 0) return undefined;
     return [{ functionDeclarations: tools.map(t => ({
       name: t.name,
       description: t.description,
-      parameters: t.input_schema
+      parameters: stripUnsupportedSchemaKeys(t.input_schema)
     })) }];
   }
 
@@ -343,13 +475,24 @@
     };
   }
 
-  function callGemini(apiKey, messages, tools, system) {
+  function callGemini(apiKey, messages, tools, system, opts = {}) {
     const model = loadModel();
     const contents = convertMessagesForGemini(messages);
     const body = { contents };
     const geminiTools = convertToolsForGemini(tools);
     if (geminiTools) body.tools = geminiTools;
     if (system) body.systemInstruction = { parts: [{ text: system }] };
+    if (opts.toolChoice) {
+      body.toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [opts.toolChoice] } };
+    }
+    const generationConfig = {};
+    if (opts.temperature !== undefined) generationConfig.temperature = opts.temperature;
+    if (opts.maxTokens) generationConfig.maxOutputTokens = opts.maxTokens;
+    // flash 系モデルは思考をオフにして分類を高速化（pro 系は思考オフ不可のため対象外）
+    if (opts.lowLatency && model.includes('flash')) {
+      generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    }
+    if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -419,10 +562,11 @@
 
   function convertToolsForOpenAI(tools) {
     if (!tools || tools.length === 0) return undefined;
-    return tools.map(t => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.input_schema }
-    }));
+    return tools.map(t => {
+      const fn = { name: t.name, description: t.description, parameters: t.input_schema };
+      if (t.strict === true) fn.strict = true;
+      return { type: 'function', function: fn };
+    });
   }
 
   function normalizeOpenAIResponse(raw) {
@@ -451,12 +595,17 @@
     };
   }
 
-  function callOpenAI(apiKey, messages, tools, system) {
+  function callOpenAI(apiKey, messages, tools, system, opts = {}) {
     const model = loadModel();
     const oaiMessages = convertMessagesForOpenAI(messages, system);
     const body = { model, messages: oaiMessages };
     const oaiTools = convertToolsForOpenAI(tools);
     if (oaiTools) body.tools = oaiTools;
+    if (opts.toolChoice) body.tool_choice = { type: 'function', function: { name: opts.toolChoice } };
+    if (opts.maxTokens) body.max_completion_tokens = opts.maxTokens;
+    // gpt-5 系は temperature の変更を受け付けないため送らない。
+    // 代わりに分類では推論を浅くしてレイテンシを削る
+    if (opts.lowLatency) body.reasoning_effort = 'low';
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -486,16 +635,16 @@
     });
   }
 
-  function callLLM(messages, tools, system) {
+  function callLLM(messages, tools, system, opts = {}) {
     const modelInfo = getModelInfo(loadModel());
     const apiKey = loadApiKey();
     if (modelInfo.provider === 'gemini') {
-      return callGemini(apiKey, messages, tools, system);
+      return callGemini(apiKey, messages, tools, system, opts);
     }
     if (modelInfo.provider === 'openai') {
-      return callOpenAI(apiKey, messages, tools, system);
+      return callOpenAI(apiKey, messages, tools, system, opts);
     }
-    return callAnthropic(apiKey, messages, tools, system);
+    return callAnthropic(apiKey, messages, tools, system, opts);
   }
 
   // ========== ツール実行 ==========
@@ -660,9 +809,9 @@
 
 ## 初回応答
 
-コメント一覧を受け取ったら以下の形式で応答する:
+初回メッセージには AIフィルターの分類結果サマリーとコメント一覧が含まれる。以下の形式で応答する:
 
-1. 天気予報形式の治安評価（1行目）:
+1. 天気予報形式の治安評価（1行目）。分類結果の件数と全体に占める割合を根拠にする:
    - ☀️ 快晴 — 良好、フィルター不要
    - 🌤️ 晴れ時々曇り — 概ね良好、少し気になる程度
    - ☁️ 曇り — やや荒れ、フィルター推奨
@@ -671,15 +820,18 @@
 
 2. 評価コメント（2〜3文）
 
-3. ☀️以外の場合のみフィルター提案。各提案は「[提案]」で始める（UIでボタンに変換される）。
-   提案は1行のみ、補足説明やコメント原文の引用は不要。
-   例:
-   - [提案] 差別的な表現を含むコメントを粛清する
-   - [提案] 政治的な煽り合いを非表示にする
+フィルター実行の提案ボタンは UI 側で別途表示されるため、提案の列挙は不要。
 
 ## 会話の継続
 
-追加指示（「消して」「翻訳して」等）にはツールで対応する。
+追加指示（「消して」「翻訳して」等）にはツールで対応する。ユーザーがフィルター指示を出したら、確認を求めずに即座にツールコールで粛清を実行する。「〜してよいか？」のような確認は不要。
+
+## コメントデータの形式
+
+各コメント行は「#番号  [時刻]  ユーザータグ  本文」のタブ区切り。
+- ツールの ids にはコメント番号（例: "12"）を指定する
+- hide_user の user_ids にはユーザータグ（例: "u3"）を指定する
+- 同一ユーザータグが複数の問題コメントを投稿している場合は、hide_user でユーザー単位でまとめて粛清できる
 
 ## ニコニコ動画の文化を尊重する
 
@@ -689,16 +841,9 @@
 - コメントアート（AAや記号で構成された装飾コメント）
 これらはニコニコ動画の視聴体験の一部であり、荒らしではない。
 
-## コメントデータの形式
-
-各コメント行は「時刻  コメントID  ユーザーID  本文」のタブ区切り。
-同一ユーザーIDが複数の問題コメントを投稿している場合は、hide_user ツールでユーザー単位でまとめて粛清できる。
-
 ## 重要
 
 - 実際の操作はツールコールで行う
-- 初回は評価と提案のみ（ツールは使わない）
-- ユーザーがフィルター指示を出したら、確認を求めずに即座にツールコールで粛清を実行する。「〜してよいか？」のような確認は不要
 - 対象コメントの原文を列挙しない。件数と操作結果だけ報告する`;
 
   function openChatModal(store, player) {
@@ -731,17 +876,49 @@
     }
     uniqueComments.sort((a, b) => a.vposMs - b.vposMs);
 
+    // 連番インデックスとユーザータグ。LLM には短いトークンだけを渡し、
+    // JS 側で実IDへ復元する（長いIDの転記ミスによる「静かな失敗」を防ぐ）
+    const indexToComment = new Map();
+    const userIdToTag = new Map();
+    const userTagToId = new Map();
+    uniqueComments.forEach((c, i) => {
+      c.index = i + 1;
+      indexToComment.set(c.index, c);
+      if (c.userId && !userIdToTag.has(c.userId)) {
+        const tag = 'u' + (userIdToTag.size + 1);
+        userIdToTag.set(c.userId, tag);
+        userTagToId.set(tag, c.userId);
+      }
+      c.userTag = c.userId ? userIdToTag.get(c.userId) : '';
+    });
+
+    function formatCommentLine(c) {
+      return `#${c.index}\t[${formatVpos(c.vposMs)}]\t${c.userTag}\t${c.body.replace(/\s*\n\s*/g, ' ')}`;
+    }
+
+    // 番号("12" / "#12")または実IDを実コメントIDに解決する。不明なら null
+    function resolveCommentToken(token) {
+      const t = String(token).trim().replace(/^#/, '');
+      if (/^\d+$/.test(t)) {
+        const c = indexToComment.get(Number(t));
+        if (c) return c.id;
+      }
+      return commentMap[t] ? t : null;
+    }
+
     function expandIds(rawIds) {
-      const ids = (Array.isArray(rawIds) ? rawIds : typeof rawIds === 'string' ? [rawIds] : Object.values(rawIds ?? {}).flat()).map(String);
+      const tokens = (Array.isArray(rawIds) ? rawIds : typeof rawIds === 'string' ? [rawIds] : Object.values(rawIds ?? {}).flat()).map(String);
       const expanded = [];
-      for (const id of ids) {
+      let unresolved = 0;
+      for (const token of tokens) {
+        const id = resolveCommentToken(token);
+        if (id === null) { unresolved++; continue; }
         const c = commentMap[id];
-        if (!c) { expanded.push(id); continue; }
-        const siblings = bodyToIds.get(c.body);
+        const siblings = c ? bodyToIds.get(c.body) : null;
         if (siblings) expanded.push(...siblings);
         else expanded.push(id);
       }
-      return [...new Set(expanded)];
+      return { ids: [...new Set(expanded)], unresolved };
     }
 
     const conversationMessages = [];
@@ -1113,9 +1290,10 @@
 
       try {
         const response = await callLLM(
-          conversationMessages, TOOLS, CHAT_SYSTEM_PROMPT
+          conversationMessages, TOOLS, CHAT_SYSTEM_PROMPT,
+          { maxTokens: 8192, cacheConversation: true }
         );
-        if (response.usage) recordUsage(loadModel(), response.usage.input_tokens, response.usage.output_tokens);
+        if (response.usage) recordUsage(loadModel(), response.usage);
 
         thinking.remove();
 
@@ -1128,16 +1306,21 @@
         conversationMessages.push({ role: 'assistant', content: response.content });
 
         if (toolCalls.length > 0) {
+          let unresolvedCount = 0;
           for (const tc of toolCalls) {
             if (tc.name === 'hide_comments') {
-              tc.input.ids = expandIds(tc.input.ids);
+              const { ids, unresolved } = expandIds(tc.input.ids);
+              tc.input.ids = ids;
+              unresolvedCount += unresolved;
             } else if (tc.name === 'replace_comments') {
               const seen = new Set();
               const expanded = [];
               const replacements = Array.isArray(tc.input.replacements) ? tc.input.replacements : Object.values(tc.input.replacements ?? {});
-            for (const r of replacements) {
-                const siblings = bodyToIds.get(commentMap[r.id]?.body);
-                const ids = siblings || [r.id];
+              for (const r of replacements) {
+                const realId = resolveCommentToken(r.id);
+                if (realId === null) { unresolvedCount++; continue; }
+                const siblings = bodyToIds.get(commentMap[realId]?.body);
+                const ids = siblings || [realId];
                 for (const id of ids) {
                   if (!seen.has(id)) {
                     seen.add(id);
@@ -1146,6 +1329,16 @@
                 }
               }
               tc.input.replacements = expanded;
+            } else if (tc.name === 'hide_user') {
+              const tags = (Array.isArray(tc.input.user_ids) ? tc.input.user_ids : typeof tc.input.user_ids === 'string' ? [tc.input.user_ids] : Object.values(tc.input.user_ids ?? {}).flat()).map(String);
+              const realIds = [];
+              for (const tag of tags) {
+                const t = tag.trim();
+                if (userTagToId.has(t)) realIds.push(userTagToId.get(t));
+                else if (userIdToTag.has(t)) realIds.push(t);
+                else unresolvedCount++;
+              }
+              tc.input.user_ids = realIds;
             }
           }
 
@@ -1175,6 +1368,10 @@
             bubble.innerHTML = `${resultLines.join(' / ')}<details style="margin-top:6px;"><summary style="cursor:pointer;color:${NC.textLow};font-size:11px;">詳細を表示</summary><pre style="margin-top:4px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:${NC.textLow};max-height:300px;overflow-y:auto;">${details.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</pre></details>`;
             chatLog.appendChild(bubble);
             chatLog.scrollTop = chatLog.scrollHeight;
+          }
+
+          if (unresolvedCount > 0) {
+            addStatusBubble(`⚠ ${unresolvedCount} 件の指定は該当するコメント/ユーザーが見つからなかったのだ`);
           }
 
           const toolResults = toolCalls.map(tc => ({
@@ -1212,6 +1409,218 @@
       }
     });
 
+    // ========== 分類実行 ==========
+
+    function buildMetaSection() {
+      const meta = getVideoMetadata();
+      const metaLines = [];
+      if (meta.title) metaLines.push(`動画タイトル: ${meta.title}`);
+      if (meta.tags.length > 0) metaLines.push(`タグ: ${meta.tags.join('、')}`);
+      return metaLines.length > 0 ? `## 動画情報\n${metaLines.join('\n')}\n\n` : '';
+    }
+
+    // チャンク境界をずらした2本の独立スイープを同じワーカープールに同時に流し、
+    // 問題判定の和集合を取る（取りこぼし対策。境界が変わると文脈のまとまりが変わるため、
+    // 片方が拾い損ねたコメントをもう片方が拾える。直列の検証パスと違い待ち時間が増えない）
+    async function classifyAllComments(onProgress) {
+      // 動画情報は全チャンク共通なのでシステムプロンプト側に置き、
+      // ツール定義+システムをキャッシュ可能な安定プレフィックスとして共有する
+      const metaSection = buildMetaSection();
+      const system = metaSection ? `${FILTER_SYSTEM_PROMPT}\n\n${metaSection.trim()}` : FILTER_SYSTEM_PROMPT;
+      const verdictMap = new Map(); // index -> category（問題判定のみ。未登録 = ok）
+      const priority = new Map(FILTER_CATEGORIES.map((fc, i) => [fc.key, i]));
+
+      function makeChunks(offset) {
+        const chunks = [];
+        if (offset > 0) chunks.push(uniqueComments.slice(0, offset));
+        for (let i = offset; i < uniqueComments.length; i += CLASSIFY_CHUNK_SIZE) {
+          chunks.push(uniqueComments.slice(i, i + CLASSIFY_CHUNK_SIZE));
+        }
+        return chunks.filter(c => c.length > 0);
+      }
+
+      const offset = Math.floor(CLASSIFY_CHUNK_SIZE / 2);
+      const queue = makeChunks(0);
+      if (uniqueComments.length > offset) queue.push(...makeChunks(offset));
+      const total = queue.length;
+      let done = 0;
+      const startTime = Date.now();
+
+      function formatEta(sec) {
+        if (sec < 60) return `約${sec}秒`;
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return s > 0 ? `約${m}分${s}秒` : `約${m}分`;
+      }
+
+      // これまでのスループット（完了チャンク/経過時間）から残り時間を推定する。
+      // ウォームアップ直後は直列分を含むため過大に出るが、進むにつれ収束する
+      function reportProgress() {
+        if (done === 0 || done >= total) {
+          onProgress(`分類中... ${done}/${total}`);
+          return;
+        }
+        const elapsedSec = (Date.now() - startTime) / 1000;
+        const remainSec = Math.max(1, Math.ceil((elapsedSec / done) * (total - done)));
+        onProgress(`分類中... ${done}/${total}（残り${formatEta(remainSec)}）`);
+      }
+
+      reportProgress();
+
+      async function processChunk(chunk) {
+        const lines = chunk.map(c => `#${c.index}\t${c.body.replace(/\s*\n\s*/g, ' ')}`).join('\n');
+        const message = `以下のコメント ${chunk.length} 件から、問題のあるコメントを報告してください。\n\n${lines}`;
+        const response = await callLLM(
+          [{ role: 'user', content: message }],
+          [CLASSIFY_TOOL],
+          system,
+          { maxTokens: 4096, temperature: 0, toolChoice: 'classify_comments', lowLatency: true, cacheSystem: true }
+        );
+        if (response.usage) recordUsage(loadModel(), response.usage);
+        for (const block of response.content) {
+          if (block.type !== 'tool_use' || block.name !== 'classify_comments') continue;
+          const input = block.input || {};
+          for (const fc of FILTER_CATEGORIES) {
+            const arr = Array.isArray(input[fc.key]) ? input[fc.key] : [];
+            for (const raw of arr) {
+              const idx = Number(String(raw).replace(/^#/, ''));
+              if (!indexToComment.has(idx)) continue;
+              const existing = verdictMap.get(idx);
+              // 2スイープの判定が食い違ったら優先度の高いカテゴリを採用
+              if (existing === undefined || priority.get(fc.key) < priority.get(existing)) {
+                verdictMap.set(idx, fc.key);
+              }
+            }
+          }
+        }
+        done++;
+        reportProgress();
+      }
+
+      // Anthropic のキャッシュエントリは最初のレスポンス完了後に読めるようになるため、
+      // 全並列で投げると全リクエストがキャッシュミス（全額課金）になる。
+      // 1本目だけ先行してキャッシュを温めてから、残りを並列で流す
+      if (getModelInfo(loadModel()).provider === 'anthropic' && queue.length > 1) {
+        await processChunk(queue.shift());
+      }
+
+      async function worker() {
+        while (queue.length > 0) {
+          await processChunk(queue.shift());
+        }
+      }
+      const workers = [];
+      for (let i = 0; i < Math.min(CLASSIFY_CONCURRENCY, queue.length); i++) {
+        workers.push(worker());
+      }
+      await Promise.all(workers);
+      return verdictMap;
+    }
+
+    // 分類結果からカテゴリ単位の提案ボタンを表示（実行は LLM を介さず JS で確定的に行う）
+    function renderCategorySuggestions(byCat) {
+      const available = FILTER_CATEGORIES
+        .map(fc => ({ key: fc.key, label: fc.label, comments: byCat[fc.key] || [] }))
+        .filter(fc => fc.comments.length > 0);
+      if (available.length === 0) return;
+
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:flex-start;gap:8px;align-self:flex-start;max-width:90%;width:100%;';
+      const icon = document.createElement('img');
+      icon.src = AI_ICON_URL;
+      icon.style.cssText = 'width:32px;height:32px;border-radius:50%;flex-shrink:0;margin-top:2px;object-fit:cover;';
+      const content = document.createElement('div');
+      content.style.cssText = `padding:10px 14px;border-radius:8px;font-size:13px;line-height:1.6;background:${NC.bgMedium};color:${NC.text};flex:1;min-width:0;`;
+      const head = document.createElement('div');
+      head.textContent = '分類結果に基づくフィルター提案なのだ（選んで実行）:';
+      content.appendChild(head);
+
+      const selected = new Set();
+      const btns = [];
+      let execBtn = null;
+      let executed = false;
+
+      function executeSelected() {
+        executed = true;
+        const chosen = available.filter(fc => selected.has(fc.key));
+        const targets = chosen.flatMap(fc => fc.comments);
+        const allIds = [...new Set(targets.flatMap(c => bodyToIds.get(c.body) || [c.id]))];
+        btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; b.style.cursor = 'default'; });
+        if (execBtn) execBtn.remove();
+
+        executeToolCalls([{ name: 'hide_comments', input: { ids: allIds } }], store, player);
+
+        const labels = chosen.map(fc => fc.label).join('、');
+        const detailLines = targets
+          .slice()
+          .sort((a, b) => a.vposMs - b.vposMs)
+          .map(c => `[${formatVpos(c.vposMs)}] ${c.body}`)
+          .join('\n');
+        const bubble = document.createElement('div');
+        bubble.style.cssText = `padding:8px 14px;border-radius:8px;font-size:12px;color:${NC.textLow};align-self:flex-start;`;
+        bubble.innerHTML = `${allIds.length} 件を粛清したのだ（${labels}）<details style="margin-top:6px;"><summary style="cursor:pointer;color:${NC.textLow};font-size:11px;">詳細を表示</summary><pre style="margin-top:4px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:${NC.textLow};max-height:300px;overflow-y:auto;">${detailLines.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</pre></details>`;
+        chatLog.appendChild(bubble);
+        chatLog.scrollTop = chatLog.scrollHeight;
+
+        // 会話履歴にも記録して、以降のチャット指示が状況を把握できるようにする
+        const indexNote = targets.length <= 100 ? `（番号: ${targets.map(c => '#' + c.index).join(' ')}）` : '';
+        conversationMessages.push({
+          role: 'user',
+          content: `（システム通知）AIフィルターの分類結果に基づき、カテゴリ「${labels}」のコメント ${allIds.length} 件${indexNote}を非表示にした。これはユーザーのボタン操作によるもので、返信は不要。`
+        });
+      }
+
+      function updateExecBtn() {
+        if (executed) return;
+        if (selected.size > 0 && !execBtn) {
+          execBtn = document.createElement('button');
+          execBtn.style.cssText = `background:${NC.azure};border:none;border-radius:4px;color:${NC.azureText};padding:8px 16px;cursor:pointer;font-size:13px;font-weight:bold;margin-top:8px;width:100%;`;
+          execBtn.onclick = executeSelected;
+          content.appendChild(execBtn);
+        }
+        if (execBtn) {
+          if (selected.size === 0) {
+            execBtn.remove();
+            execBtn = null;
+            return;
+          }
+          const total = available.filter(fc => selected.has(fc.key)).reduce((n, fc) => n + fc.comments.length, 0);
+          execBtn.textContent = `選択した ${total} 件を粛清`;
+        }
+      }
+
+      for (const fc of available) {
+        const btn = document.createElement('button');
+        btn.textContent = `▶ ${fc.label} ${fc.comments.length} 件を粛清`;
+        btn.style.cssText = `display:block;background:${NC.actionBase};border:1px solid ${NC.border};border-radius:4px;color:${NC.text};padding:6px 12px;cursor:pointer;font-size:13px;text-align:left;width:100%;margin-top:6px;transition:background 0.15s;`;
+        let isSelected = false;
+        btn.onclick = () => {
+          if (executed) return;
+          isSelected = !isSelected;
+          if (isSelected) {
+            selected.add(fc.key);
+            btn.style.background = NC.azure;
+            btn.style.color = NC.azureText;
+            btn.style.borderColor = NC.azure;
+          } else {
+            selected.delete(fc.key);
+            btn.style.background = NC.actionBase;
+            btn.style.color = NC.text;
+            btn.style.borderColor = NC.border;
+          }
+          updateExecBtn();
+        };
+        btn.onmouseenter = () => { if (!isSelected && !executed) btn.style.background = NC.actionHover; };
+        btn.onmouseleave = () => { if (!isSelected) btn.style.background = NC.actionBase; };
+        btns.push(btn);
+        content.appendChild(btn);
+      }
+
+      row.append(icon, content);
+      chatLog.appendChild(row);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
     // Start button
     function startAnalysis() {
       const apiKey = loadApiKey();
@@ -1220,29 +1629,40 @@
         switchTab('settings');
         return;
       }
-      const meta = getVideoMetadata();
-      const metaLines = [];
-      if (meta.title) metaLines.push(`動画タイトル: ${meta.title}`);
-      if (meta.tags.length > 0) metaLines.push(`タグ: ${meta.tags.join('、')}`);
-      const metaSection = metaLines.length > 0 ? `## 動画情報\n${metaLines.join('\n')}\n\n` : '';
-      const commentLines = uniqueComments.map(c => `[${formatVpos(c.vposMs)}]\t${c.id}\t${c.userId}\t${c.body}`).join('\n');
-      const initialMessage = `${metaSection}以下はこの動画のコメント一覧（${uniqueComments.length} 件、重複除去済み）なのだ。治安を評価してほしいのだ。\n\n${commentLines}`;
-      conversationMessages.push({ role: 'user', content: initialMessage });
-      const initStatus = addStatusBubble(`コメント ${uniqueComments.length} 件を分析中...`, { spinner: true });
+      const status = addStatusBubble(`コメント ${uniqueComments.length} 件を分析中...`, { spinner: true });
+      const setStatus = (text) => { status.lastChild.textContent = text; };
       (async () => {
         isSending = true;
         sendBtn.disabled = true;
         sendBtn.style.opacity = '0.5';
         try {
-          const response = await callLLM(conversationMessages, TOOLS, CHAT_SYSTEM_PROMPT);
-          if (response.usage) recordUsage(loadModel(), response.usage.input_tokens, response.usage.output_tokens);
-          initStatus.remove();
-          const textBlocks = response.content.filter(b => b.type === 'text');
-          const text = textBlocks.map(b => b.text).join('\n');
+          const verdictMap = await classifyAllComments(setStatus);
+          const byCat = {};
+          for (const c of uniqueComments) {
+            const cat = verdictMap.get(c.index) ?? 'ok';
+            (byCat[cat] ??= []).push(c);
+          }
+
+          setStatus('治安を評価中...');
+          const summaryLines = FILTER_CATEGORIES
+            .map(fc => `- ${fc.label}: ${(byCat[fc.key] || []).length} 件`)
+            .join('\n');
+          const commentLines = uniqueComments.map(formatCommentLine).join('\n');
+          const initialMessage = `${buildMetaSection()}## AIフィルター分類結果（総コメント ${uniqueComments.length} 件、重複除去済み）\n${summaryLines}\n\n## コメント一覧\n${commentLines}\n\nこの分類結果とコメントを踏まえて、治安を評価してほしいのだ。`;
+          conversationMessages.push({ role: 'user', content: initialMessage });
+
+          // 初回評価はツールなしで呼ぶ（tool_use が孤立して以降の呼び出しが壊れるのを防ぐ）。
+          // コメント一覧を含む会話をキャッシュし、以降のチャットの入力コストを下げる
+          const response = await callLLM(conversationMessages, null, CHAT_SYSTEM_PROMPT, { maxTokens: 8192, cacheConversation: true });
+          if (response.usage) recordUsage(loadModel(), response.usage);
+          status.remove();
+          const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
           if (text) addBubble('assistant', text);
           conversationMessages.push({ role: 'assistant', content: response.content });
+
+          renderCategorySuggestions(byCat);
         } catch (err) {
-          initStatus.remove();
+          status.remove();
           addBubble('assistant', 'エラーが発生したのだ: ' + err.message);
         } finally {
           isSending = false;
