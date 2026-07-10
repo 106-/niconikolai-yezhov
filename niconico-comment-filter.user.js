@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         ニコニコライエジョフ
 // @namespace    https://github.com/106-
-// @version      0.3.4
+// @version      0.4.1
 // @description  Anthropic / Gemini / OpenAI API でニコニコ動画のコメントをAIフィルターする
 // @match        https://www.nicovideo.jp/watch/*
 // @match        https://nicovideo.jp/watch/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.anthropic.com
@@ -784,6 +785,84 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     return { hiddenIds, replacedIds, hideCommentCount, replaceCommentCount, hideUserCalls, hideUserCount, hideUserCommentCount };
   }
 
+  // ========== セッション永続化 ==========
+  // 動画IDごとに対話ログ・分類判定・非表示履歴を保存する。
+  // コメントの連番・実IDは訪問ごとに変わるため、永続キーは「本文」を使う
+  // （重複排除がもともと本文ベースなのでそのまま噛み合う）
+
+  const SESSION_INDEX_STORAGE = 'nicofilter_session_index';
+  const SESSION_PREFIX = 'nicofilter_session_';
+  const SESSION_MAX_VIDEOS = 10;
+
+  function currentVideoId() {
+    return location.pathname.match(/watch\/([a-z]{0,2}\d+)/)?.[1] || '';
+  }
+
+  function loadSession(videoId) {
+    if (!videoId) return null;
+    return GM_getValue(SESSION_PREFIX + videoId, null);
+  }
+
+  function saveSessionData(videoId, data) {
+    if (!videoId) return;
+    GM_setValue(SESSION_PREFIX + videoId, data);
+    let index = GM_getValue(SESSION_INDEX_STORAGE, []);
+    index = index.filter(v => v !== videoId);
+    index.push(videoId);
+    // 古い動画のセッションから間引く（会話履歴はコメント一覧を含み大きいため）
+    while (index.length > SESSION_MAX_VIDEOS) {
+      GM_deleteValue(SESSION_PREFIX + index.shift());
+    }
+    GM_setValue(SESSION_INDEX_STORAGE, index);
+  }
+
+  function clearSession(videoId) {
+    if (!videoId) return;
+    GM_deleteValue(SESSION_PREFIX + videoId);
+    const index = GM_getValue(SESSION_INDEX_STORAGE, []).filter(v => v !== videoId);
+    GM_setValue(SESSION_INDEX_STORAGE, index);
+  }
+
+  // 保存済みの非表示・書き換えを現在のストアに適用する（本文キーなので冪等）
+  function applyStoredFilters(session, store, player) {
+    if (!session || !store) return 0;
+    const hiddenSet = new Set(session.hiddenBodies || []);
+    const replaced = session.replaced || {};
+    const state = store.current();
+    const hideIds = [];
+    const repls = [];
+    for (const [key, c] of Object.entries(state.comments)) {
+      const id = String(c.id ?? key);
+      if (hiddenSet.has(c.body)) hideIds.push(id);
+      else if (replaced[c.body] !== undefined) repls.push({ id, new_body: replaced[c.body] });
+    }
+    const calls = [];
+    if (hideIds.length > 0) calls.push({ name: 'hide_comments', input: { ids: hideIds } });
+    if (repls.length > 0) calls.push({ name: 'replace_comments', input: { replacements: repls } });
+    if (calls.length > 0) executeToolCalls(calls, store, player);
+    return hideIds.length + repls.length;
+  }
+
+  // ページを開いた時点で前回のフィルターを自動再適用する。
+  // コメントは逐次ロードされるため時間を空けて数回試行する（冪等なので重複適用は無害）
+  let lastAutoAppliedVideoId = null;
+  function scheduleAutoApply() {
+    const videoId = currentVideoId();
+    if (!videoId || lastAutoAppliedVideoId === videoId) return;
+    lastAutoAppliedVideoId = videoId;
+    const session = loadSession(videoId);
+    if (!session) return;
+    const hasFilters = (session.hiddenBodies || []).length > 0 || Object.keys(session.replaced || {}).length > 0;
+    if (!hasFilters) return;
+    [3000, 8000, 15000, 30000].forEach(delay => {
+      setTimeout(() => {
+        if (currentVideoId() !== videoId) return;
+        const result = findStoreAndPlayer();
+        if (result?.store) applyStoredFilters(session, result.store, result.player);
+      }, delay);
+    });
+  }
+
 
   const NC = {
     bg:          '#252525',
@@ -924,6 +1003,31 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     const conversationMessages = [];
     let isSending = false;
 
+    // -- セッション永続化の状態 --
+    const videoId = currentVideoId();
+    const savedSession = loadSession(videoId);
+    const transcript = [];          // UI再現用の軽量ログ [{role: 'user'|'assistant'|'status', text}]
+    const verdictsByBody = {};      // 分類判定（本文 -> カテゴリ、問題判定のみ）
+    const hiddenBodies = new Set(); // 非表示にした本文
+    const replacedByBody = {};      // 書き換え（元本文 -> 新本文）
+
+    function recordTranscript(role, text) {
+      transcript.push({ role, text });
+    }
+
+    function persistSession() {
+      if (!videoId) return;
+      saveSessionData(videoId, {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        conversation: conversationMessages,
+        transcript,
+        verdicts: verdictsByBody,
+        hiddenBodies: [...hiddenBodies],
+        replaced: replacedByBody,
+      });
+    }
+
     // -- UI --
     const overlay = document.createElement('div');
     overlay.id = 'nicofilter-chat';
@@ -960,7 +1064,24 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     closeBtn.onmouseenter = () => { closeBtn.style.color = NC.text; };
     closeBtn.onmouseleave = () => { closeBtn.style.color = NC.textMedium; };
     closeBtn.onclick = () => overlay.remove();
-    header.append(tabBar, closeBtn);
+
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = 'リセット';
+    resetBtn.title = 'この動画の対話ログ・判定ログを削除';
+    resetBtn.style.cssText = `background:none;border:1px solid ${NC.border};border-radius:4px;color:${NC.textLow};font-size:11px;cursor:pointer;padding:2px 8px;margin-right:10px;`;
+    resetBtn.onmouseenter = () => { resetBtn.style.color = NC.text; };
+    resetBtn.onmouseleave = () => { resetBtn.style.color = NC.textLow; };
+    resetBtn.onclick = () => {
+      if (!confirm('この動画の対話ログと判定ログを削除するのだ。\n（非表示にしたコメントを画面に戻すにはページを再読み込み）')) return;
+      clearSession(videoId);
+      overlay.remove();
+      openChatModal(store, player);
+    };
+
+    const headerRight = document.createElement('div');
+    headerRight.style.cssText = 'display:flex;align-items:center;';
+    headerRight.append(resetBtn, closeBtn);
+    header.append(tabBar, headerRight);
 
     // Chat panel
     const chatPanel = document.createElement('div');
@@ -1283,6 +1404,7 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
 
       if (userText !== null) {
         addBubble('user', userText);
+        recordTranscript('user', userText);
         conversationMessages.push({ role: 'user', content: userText });
       }
 
@@ -1301,7 +1423,10 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
         const textBlocks = response.content.filter(b => b.type === 'text');
         const text = textBlocks.map(b => b.text).join('\n');
 
-        if (text) addBubble('assistant', text);
+        if (text) {
+          addBubble('assistant', text);
+          recordTranscript('assistant', text);
+        }
 
         conversationMessages.push({ role: 'assistant', content: response.content });
 
@@ -1344,6 +1469,19 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
 
           const { hiddenIds, replacedIds, hideCommentCount, replaceCommentCount, hideUserCalls, hideUserCount, hideUserCommentCount } = executeToolCalls(toolCalls, store, player);
 
+          // 永続化用に本文キーで記録する
+          for (const id of hiddenIds) {
+            const b = commentMap[id]?.body;
+            if (b !== undefined) hiddenBodies.add(b);
+          }
+          for (const tc of toolCalls) {
+            if (tc.name !== 'replace_comments') continue;
+            for (const r of tc.input.replacements || []) {
+              const b = commentMap[r.id]?.body;
+              if (b !== undefined) replacedByBody[b] = r.new_body;
+            }
+          }
+
           const resultLines = [];
           if (hiddenIds.length > 0) resultLines.push(`${hiddenIds.length} 件を粛清したのだ`);
           if (replacedIds.length > 0) resultLines.push(`${replacedIds.length} 件を書き換えたのだ`);
@@ -1354,10 +1492,22 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
             if (hideUserCalls > 0) summaryParts.push(`ユーザー非表示: ${hideUserCount} ユーザー (${hideUserCommentCount} 件)`);
             if (replaceCommentCount > 0) summaryParts.push(`コメント書き換え: ${replaceCommentCount} 件`);
             const summaryLine = summaryParts.length > 0 ? summaryParts.join(' / ') + '\n\n' : '';
+            // 各行に粛清理由（分類カテゴリ / チャット指示 / 書き換え）を付ける
+            const replacedSet = new Set(replacedIds);
             const resolved = allIds
-              .map(id => commentMap[id])
+              .map(id => {
+                const c = commentMap[id];
+                if (!c) return null;
+                let label;
+                if (replacedSet.has(id)) {
+                  label = '書き換え';
+                } else {
+                  const catKey = verdictsByBody[c.body];
+                  label = FILTER_CATEGORIES.find(fc => fc.key === catKey)?.label || 'チャット指示';
+                }
+                return { vposMs: c.vposMs ?? 0, line: `[${formatVpos(c.vposMs)}]【${label}】${c.body}` };
+              })
               .filter(Boolean)
-              .map(c => ({ vposMs: c.vposMs ?? 0, line: `[${formatVpos(c.vposMs)}] ${c.body}` }))
               .sort((a, b) => a.vposMs - b.vposMs)
               .map(r => r.line);
             const unresolved = allIds.length - resolved.length;
@@ -1368,6 +1518,7 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
             bubble.innerHTML = `${resultLines.join(' / ')}<details style="margin-top:6px;"><summary style="cursor:pointer;color:${NC.textLow};font-size:11px;">詳細を表示</summary><pre style="margin-top:4px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:${NC.textLow};max-height:300px;overflow-y:auto;">${details.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</pre></details>`;
             chatLog.appendChild(bubble);
             chatLog.scrollTop = chatLog.scrollHeight;
+            recordTranscript('status', resultLines.join(' / '));
           }
 
           if (unresolvedCount > 0) {
@@ -1382,6 +1533,8 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
           }));
           conversationMessages.push({ role: 'user', content: toolResults });
         }
+
+        persistSession();
       } catch (err) {
         thinking.remove();
         addBubble('assistant', 'エラーが発生したのだ: ' + err.message);
@@ -1551,10 +1704,10 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
         executeToolCalls([{ name: 'hide_comments', input: { ids: allIds } }], store, player);
 
         const labels = chosen.map(fc => fc.label).join('、');
-        const detailLines = targets
-          .slice()
-          .sort((a, b) => a.vposMs - b.vposMs)
-          .map(c => `[${formatVpos(c.vposMs)}] ${c.body}`)
+        const detailLines = chosen
+          .flatMap(fc => fc.comments.map(c => ({ c, label: fc.label })))
+          .sort((a, b) => a.c.vposMs - b.c.vposMs)
+          .map(({ c, label }) => `[${formatVpos(c.vposMs)}]【${label}】${c.body}`)
           .join('\n');
         const bubble = document.createElement('div');
         bubble.style.cssText = `padding:8px 14px;border-radius:8px;font-size:12px;color:${NC.textLow};align-self:flex-start;`;
@@ -1568,6 +1721,10 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
           role: 'user',
           content: `（システム通知）AIフィルターの分類結果に基づき、カテゴリ「${labels}」のコメント ${allIds.length} 件${indexNote}を非表示にした。これはユーザーのボタン操作によるもので、返信は不要。`
         });
+
+        targets.forEach(c => hiddenBodies.add(c.body));
+        recordTranscript('status', `${allIds.length} 件を粛清したのだ（${labels}）`);
+        persistSession();
       }
 
       function updateExecBtn() {
@@ -1642,6 +1799,11 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
             const cat = verdictMap.get(c.index) ?? 'ok';
             (byCat[cat] ??= []).push(c);
           }
+          // 永続化用に本文キーで判定を記録する
+          for (const [idx, cat] of verdictMap) {
+            const c = indexToComment.get(idx);
+            if (c) verdictsByBody[c.body] = cat;
+          }
 
           setStatus('治安を評価中...');
           const summaryLines = FILTER_CATEGORIES
@@ -1657,10 +1819,14 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
           if (response.usage) recordUsage(loadModel(), response.usage);
           status.remove();
           const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-          if (text) addBubble('assistant', text);
+          if (text) {
+            addBubble('assistant', text);
+            recordTranscript('assistant', text);
+          }
           conversationMessages.push({ role: 'assistant', content: response.content });
 
           renderCategorySuggestions(byCat);
+          persistSession();
         } catch (err) {
           status.remove();
           addBubble('assistant', 'エラーが発生したのだ: ' + err.message);
@@ -1672,16 +1838,52 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       })();
     }
 
-    const startBtn = document.createElement('button');
-    startBtn.textContent = `▶ コメント ${uniqueComments.length} 件を分析`;
-    startBtn.style.cssText = `background:${NC.azure};border:none;border-radius:6px;color:${NC.azureText};padding:12px 24px;cursor:pointer;font-size:14px;font-weight:bold;margin:auto;`;
-    startBtn.onmouseenter = () => { startBtn.style.background = NC.azureHover; };
-    startBtn.onmouseleave = () => { startBtn.style.background = NC.azure; };
-    startBtn.onclick = () => {
-      startBtn.remove();
-      startAnalysis();
-    };
-    chatLog.appendChild(startBtn);
+    // ========== セッション復元 ==========
+
+    function restoreSession(session) {
+      conversationMessages.push(...(session.conversation || []));
+      transcript.push(...(session.transcript || []));
+      Object.assign(verdictsByBody, session.verdicts || {});
+      (session.hiddenBodies || []).forEach(b => hiddenBodies.add(b));
+      Object.assign(replacedByBody, session.replaced || {});
+
+      // 対話ログを再描画
+      for (const entry of transcript) {
+        if (entry.role === 'status') addStatusBubble(entry.text);
+        else addBubble(entry.role, entry.text);
+      }
+
+      // フィルターを再適用（自動適用が既に走っていても本文キーなので冪等）
+      const applied = applyStoredFilters(session, store, player);
+      const when = (session.updatedAt || '').replace('T', ' ').slice(0, 16);
+      addStatusBubble(`前回のセッション（${when}）を復元したのだ` + (applied > 0 ? `。フィルター ${applied} 件を再適用` : ''));
+
+      // 未実行の分類結果が残っていれば提案ボタンも復元する
+      const byCat = {};
+      for (const c of uniqueComments) {
+        const cat = verdictsByBody[c.body];
+        if (cat && !hiddenBodies.has(c.body)) (byCat[cat] ??= []).push(c);
+      }
+      renderCategorySuggestions(byCat);
+    }
+
+    const hasSavedSession = savedSession
+      && ((savedSession.conversation || []).length > 0 || Object.keys(savedSession.verdicts || {}).length > 0);
+
+    if (hasSavedSession) {
+      restoreSession(savedSession);
+    } else {
+      const startBtn = document.createElement('button');
+      startBtn.textContent = `▶ コメント ${uniqueComments.length} 件を分析`;
+      startBtn.style.cssText = `background:${NC.azure};border:none;border-radius:6px;color:${NC.azureText};padding:12px 24px;cursor:pointer;font-size:14px;font-weight:bold;margin:auto;`;
+      startBtn.onmouseenter = () => { startBtn.style.background = NC.azureHover; };
+      startBtn.onmouseleave = () => { startBtn.style.background = NC.azure; };
+      startBtn.onclick = () => {
+        startBtn.remove();
+        startAnalysis();
+      };
+      chatLog.appendChild(startBtn);
+    }
   }
 
   // ========== ボタン注入 ==========
@@ -1742,10 +1944,12 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       if (!document.getElementById('nicofilter-btn-wrap')) {
         injectButton();
       }
+      scheduleAutoApply(); // SPA遷移で動画が変わった場合もここで拾う
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
     injectButton();
+    scheduleAutoApply();
   }
 
   if (document.readyState === 'loading') {
