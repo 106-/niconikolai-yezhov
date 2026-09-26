@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ニコニコライエジョフ
 // @namespace    https://github.com/106-
-// @version      0.4.1
-// @description  Anthropic / Gemini / OpenAI API でニコニコ動画のコメントをAIフィルターする
+// @version      0.5.0
+// @description  Anthropic / Gemini / OpenAI API（分類は TypeSafe Jev も選択可）でニコニコ動画のコメントをAIフィルターする
 // @match        https://www.nicovideo.jp/watch/*
 // @match        https://nicovideo.jp/watch/*
 // @grant        GM_setValue
@@ -13,6 +13,7 @@
 // @connect      api.anthropic.com
 // @connect      generativelanguage.googleapis.com
 // @connect      api.openai.com
+// @connect      api.typesafe.ai
 // @updateURL    https://github.com/106-/niconikolai-yezhov/raw/refs/heads/main/niconico-comment-filter.user.js
 // @downloadURL  https://github.com/106-/niconikolai-yezhov/raw/refs/heads/main/niconico-comment-filter.user.js
 // @run-at       document-idle
@@ -22,27 +23,39 @@
   'use strict';
 
   const MODEL_STORAGE = 'nicofilter_model';
+  const CLASSIFIER_STORAGE = 'nicofilter_classifier'; // '' = チャットと同じモデル、'jev' = TypeSafe Jev
   const USAGE_STORAGE = 'nicofilter_usage';
-  const DEFAULT_MODEL = 'claude-sonnet-4-6';
+  const DEFAULT_MODEL = 'gpt-6-luna';
+  const DEFAULT_CLASSIFIER = 'jev';
 
   const PROVIDERS = {
     anthropic: { keyStorage: 'nicofilter_apikey_anthropic' },
     gemini:    { keyStorage: 'nicofilter_apikey_gemini' },
     openai:    { keyStorage: 'nicofilter_apikey_openai' },
+    typesafe:  { keyStorage: 'nicofilter_apikey_typesafe' },
   };
 
+  // 料金は 2026-09 時点の各社公式ページ（USD / 1M トークン、プロンプト 200k 以下の標準料金）。
+  // API の癖はモデルごとのフラグで吸収する:
+  //   noSampling     … temperature を送ると 400（Anthropic 5 世代）/ 非推奨（Gemini 3 は既定 1.0 推奨）
+  //   alwaysThinking … 思考を切れず、tool_choice の強制が 400（Claude Opus 5.5）
+  //   thinkingByDefault … 省略時に適応的思考が走る（Claude Sonnet 5 以降）。思考トークンも max_tokens に含まれる
+  //   lowLatencyThinking … 分類時の Gemini 3 の thinkingLevel（thinkingBudget: 0 は Gemini 3 では使えない）
   const MODELS = [
-    { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5',    provider: 'anthropic', inputPer1M: 1.00,  outputPer1M: 5.00 },
-    { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6',   provider: 'anthropic', inputPer1M: 3.00,  outputPer1M: 15.00 },
-    { id: 'claude-opus-4-6',           label: 'Opus 4.6',     provider: 'anthropic', inputPer1M: 5.00,  outputPer1M: 25.00 },
-    { id: 'gemini-3.1-flash-lite', label: 'Gemini Flash-Lite', provider: 'gemini', inputPer1M: 0.25, outputPer1M: 1.50 },
-    { id: 'gemini-3.5-flash',      label: 'Gemini 3.5 Flash', provider: 'gemini', inputPer1M: 1.50,  outputPer1M: 9.00 },
-    { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro',  provider: 'gemini', inputPer1M: 2.00,  outputPer1M: 12.00 },
-    { id: 'gpt-5.4-nano', label: 'GPT-5.4 nano', provider: 'openai', inputPer1M: 0.20, outputPer1M: 1.25 },
-    { id: 'gpt-5.4-mini', label: 'GPT-5.4 mini', provider: 'openai', inputPer1M: 0.75, outputPer1M: 4.50 },
-    { id: 'gpt-5.4',      label: 'GPT-5.4',      provider: 'openai', inputPer1M: 2.50, outputPer1M: 15.00 },
-    { id: 'gpt-5.5',      label: 'GPT-5.5',      provider: 'openai', inputPer1M: 5.00, outputPer1M: 30.00 },
+    { id: 'claude-haiku-4-5', label: 'Haiku 4.5',   provider: 'anthropic', inputPer1M: 1.00,  outputPer1M: 5.00 },
+    { id: 'claude-sonnet-5',  label: 'Sonnet 5',    provider: 'anthropic', inputPer1M: 2.00,  outputPer1M: 10.00, noSampling: true, thinkingByDefault: true },
+    { id: 'claude-opus-5-5',  label: 'Opus 5.5',    provider: 'anthropic', inputPer1M: 4.00,  outputPer1M: 20.00, noSampling: true, thinkingByDefault: true, alwaysThinking: true },
+    { id: 'gemini-3.5-flash-lite',  label: 'Gemini 3.5 Flash-Lite', provider: 'gemini', inputPer1M: 0.30, outputPer1M: 2.50, noSampling: true, lowLatencyThinking: 'MINIMAL' },
+    // 3.8 Flash は 2026-12-31 までの導入価格。2027-01-01 から $1.50 / $7.50
+    { id: 'gemini-3.8-flash',       label: 'Gemini 3.8 Flash',      provider: 'gemini', inputPer1M: 0.75, outputPer1M: 3.75, noSampling: true, lowLatencyThinking: 'MINIMAL' },
+    { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro',        provider: 'gemini', inputPer1M: 2.00, outputPer1M: 12.00, noSampling: true, lowLatencyThinking: 'LOW' },
+    { id: 'gpt-6-luna',  label: 'GPT-6 Luna',  provider: 'openai', inputPer1M: 0.10,  outputPer1M: 0.50 },
+    { id: 'gpt-6-sol',   label: 'GPT-6 Sol',   provider: 'openai', inputPer1M: 2.00,  outputPer1M: 10.00 },
   ];
+
+  // Jev は文章を生成できないため、チャット用の MODELS には入れず分類専用の選択肢にする。
+  // 出力トークンは無料（入力のみ課金）
+  const JEV_MODEL = { id: 'jev-1.13.0', label: 'Jev 1.13', provider: 'typesafe', inputPer1M: 0.042, outputPer1M: 0 };
 
   function getModelInfo(modelId) {
     return MODELS.find(m => m.id === modelId) || MODELS[0];
@@ -88,12 +101,21 @@
     GM_setValue(MODEL_STORAGE, model);
   }
 
+  function loadClassifier() {
+    return GM_getValue(CLASSIFIER_STORAGE, DEFAULT_CLASSIFIER);
+  }
+
+
+  function saveClassifier(classifier) {
+    GM_setValue(CLASSIFIER_STORAGE, classifier);
+  }
+
   function loadUsage() {
     return GM_getValue(USAGE_STORAGE, { totalInput: 0, totalOutput: 0, totalCostUSD: 0, history: [] });
   }
 
   function recordUsage(model, u) {
-    const m = MODELS.find(x => x.id === model) || MODELS[0];
+    const m = [...MODELS, JEV_MODEL].find(x => x.id === model) || MODELS[0];
     const input = u.input_tokens || 0;
     const output = u.output_tokens || 0;
     // Anthropic のプロンプトキャッシュ: 書き込みは 1.25 倍、読み出しは 0.1 倍で課金される
@@ -353,34 +375,147 @@ ok とする例（境界）:
 動画と無関係な宣伝・誘導・チャンネル誘導、意味のない文字列の連投。
 ok とする例（境界）: 「回転！」「FND!」「真水につけろ」「8888」のような弾幕・シリーズお約束の繰り返しは spam ではなく ok`;
 
-  function callAnthropic(apiKey, messages, tools, system, opts = {}) {
-    const model = loadModel();
-    const body = { model, max_tokens: opts.maxTokens ?? 4096, messages };
-    if (tools) body.tools = tools;
-    if (system) {
-      // cacheSystem: ツール定義+システムプロンプト（安定プレフィックス）をキャッシュする。
-      // Sonnet 4.6 の最低キャッシュ長は 2048 トークンなので、プレフィックスはそれ以上に保つこと
-      body.system = opts.cacheSystem
-        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
-        : system;
+  // ========== TypeSafe Jev（分類専用） ==========
+  // ルーブリックを state に1回だけ置き、民族揶揄の隠語辞書を添える構成。
+  // Jev は字面どおりに読むので、LLM なら文化知識で拾える隠語を辞書で補う。
+  // 英語が主言語なので定義は英語、判定例は日本語の実コメントのまま渡す
+
+  // 1リクエストは state + 全質問で 64k トークンが上限（超えると max_tokens_exceeded の 400）。
+  // 件数ではなく推定トークンで詰める。推定は実測に対し ±9% 以内なので 55k なら上限に届かない
+  const JEV_TOKEN_BUDGET = 55000;
+  const JEV_MAX_PER_CHUNK = 255;
+  // 3883 件（29 チャンク）で並列 8 / 16 / 32 = 2.8 / 1.6 / 1.2 秒、いずれも 429 なし。
+  // レート制限は予告なく変わる（公式）ので、上限に寄せすぎない 16 にする。429 は callJev が再試行する
+  const JEV_CONCURRENCY = 16;
+  const JEV_THRESHOLD = 0.5;      // 1 - P(ok) がこれ以上なら問題ありと判定する
+
+  const JEV_RUBRIC = {
+    ok: {
+      what: 'Normal viewer comments: reactions, impressions, analysis, jokes, danmaku / meme chants, soramimi, comment art, '
+        + 'and blunt criticism of the people, organization or culture that the video itself is about.',
+      not_for: 'Slurs, insulting generalizations about a whole ethnicity/nationality, or attacks on other viewers.',
+      examples: ['機長無能すぎる', '韓国と日本の上下関係は異常だよな　「上は全て正しい」', '8888'],
+    },
+    discrimination: {
+      what: 'Slurs against an ethnicity, nationality, race or gender; insulting generalizations about everyone with that attribute; '
+        + 'jokes or hoaxes that mock an ethnic group.',
+      not_for: 'Calm discussion of cultural or organizational factors that the video treats as a cause (e.g. cockpit hierarchy). '
+        + 'Mentioning a country name alone is not discrimination.',
+      examples: ['だって韓国人だもの', 'チョンは引継ぎしない、チョン産ネトゲみてりゃ分かるね'],
+      known_mockery_vocabulary: {
+        note: 'Japanese internet slang used to mock Koreans, Chinese and other groups. A comment that uses these to ridicule '
+          + 'the group (not to discuss it) is discrimination, even when phrased as a joke or a meme parody.',
+        terms: {
+          'チョン / チョンコ / 朝鮮人 used as an insult / ウンコク / 南朝鮮 / ヒトモドキ / 土人 / 支那 / ジャップ': 'ethnic slurs',
+          'キムチ / ヤンニョム / トンスル (+「〜に漬けろ」)': 'Korean food or "feces liquor" used as an ethnic joke; parodies of the series meme 「真水につけろ」',
+          '火病 (ファビョる)': 'stereotype that Koreans are pathologically hot-tempered',
+          'ニダ / ニカ / ウリ / ウリナラ / (｀∀´) / <丶｀∀´>': 'mock imitation of Korean speech; the 「ニダー」 caricature',
+          'ケンチャナヨ (主義 / 精神)': 'stereotype that Koreans are sloppy and ignore safety',
+          '半万年の歴史 / 属国 / 事大主義 / 建国してない': 'mockery of Korean history and sovereignty',
+          'さすが韓国 / いつもの韓国 / これが韓国だ / 韓国だから / 彼の国': 'sarcasm attributing a failure to the whole nationality',
+          '特ア / 特定アジア': 'derogatory grouping of China and the Koreas',
+        },
+      },
+    },
+    harassment: {
+      what: 'Strong abuse or defamation aimed at a specific person (the uploader, a named person, a creator): "die", "trash", relentless attacks.',
+      not_for: 'Light tsukkomi about what happens in the video, e.g. calling the pilot incompetent.',
+      examples: ['うp主死ね'],
+    },
+    flamewar: {
+      what: 'Attacking other viewers or their comments (often with ↑ / ↓), continuing a comment-section argument, political labeling, '
+        + 'or provoking the whole comment section.',
+      not_for: 'Calm replies or additions to another comment; describing that the comments are heated.',
+      examples: ['↓黙れ朝鮮人', 'お前の目は節穴か？'],
+    },
+    spoiler: {
+      what: 'Revealing the ending, culprit or root cause concretely before the video reveals it.',
+      not_for: 'Ritual series-style foreshadowing comments; mentioning information the video already showed.',
+      examples: ['先に言っとくと原因は姿勢指示器の故障を機長が無視したこと'],
+    },
+    spam: {
+      what: 'Advertising or channel promotion unrelated to the video, links luring viewers elsewhere, meaningless repeated strings.',
+      not_for: 'Danmaku and series in-jokes repeated by many viewers (e.g. 8888, 回転！, FND!).',
+      examples: ['チャンネル登録よろしく！ youtube.com/@xxxx'],
+    },
+  };
+
+  // Choice の選択肢は ok + FILTER_CATEGORIES のキー。境界の詳細は state.rubric を参照させる
+  const JEV_CRITERIA = Object.fromEntries(Object.entries(JEV_RUBRIC).map(([k, v]) => [k, v.what]));
+
+  function buildJevRequest(comments, meta) {
+    const state = {
+      context: 'Comment stream of a niconico video (Japanese). Comments are sorted by playback time. '
+        + 'Nearby comments are context for each judgment.',
+      video: { title: meta.title, tags: meta.tags },
+      rubric: JEV_RUBRIC,
+      comments: comments.map(jevCommentEntry),
+    };
+    const questions = {};
+    for (const c of comments) questions[`c${c.index}`] = jevQuestion(c);
+    return { model: JEV_MODEL.id, state, questions };
+  }
+
+  function jevCommentEntry(c) {
+    const sec = Math.floor((c.vposMs ?? 0) / 1000);
+    return { n: c.index, t: `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`, text: c.body };
+  }
+
+  function jevQuestion(c) {
+    // 対象コメントの本文は instructions に直接入れる（Jev は state 内の間接参照が苦手）
+    return {
+      type: 'choice',
+      instructions: {
+        target_comment: { n: c.index, text: c.body },
+        question: 'Which category does `target_comment` belong to? Apply the boundaries and examples in `rubric`. '
+          + 'Judge only the target comment; other comments are context.',
+      },
+      criteria: JEV_CRITERIA,
+    };
+  }
+
+  // 文字種ごとの重み + 1問あたりの固定分でトークン数を推定する。
+  // 係数は実 API の usage に最小二乗で合わせた値
+  function estimateJevTokens(value, questions = 0) {
+    const text = JSON.stringify(value);
+    let ascii = 0;
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) < 128) ascii++;
+    return ascii * 0.233 + (text.length - ascii) * 1.089 + questions * 76;
+  }
+
+  // 推定トークンが JEV_TOKEN_BUDGET に収まるようにコメントを詰めてチャンクに分ける
+  function chunkForJev(comments, meta) {
+    const base = estimateJevTokens(buildJevRequest([], meta));
+    const chunks = [];
+    let current = [];
+    let used = base;
+    for (const c of comments) {
+      const cost = estimateJevTokens(jevCommentEntry(c)) + estimateJevTokens(jevQuestion(c), 1);
+      if (current.length > 0 && (used + cost > JEV_TOKEN_BUDGET || current.length >= JEV_MAX_PER_CHUNK)) {
+        chunks.push(current);
+        current = [];
+        used = base;
+      }
+      current.push(c);
+      used += cost;
     }
-    // cacheConversation: 最後のキャッシュ可能ブロックに自動配置（会話履歴全体をキャッシュ）
-    if (opts.cacheConversation) body.cache_control = { type: 'ephemeral' };
-    if (opts.toolChoice) body.tool_choice = { type: 'tool', name: opts.toolChoice };
-    // 分類の決定性向上用。現行の 4.6 系モデルは temperature を受け付ける
-    if (opts.temperature !== undefined) body.temperature = opts.temperature;
+    if (current.length > 0) chunks.push(current);
+    return chunks;
+  }
+
+  // Chrome の Tampermonkey 5.3+ は GM_xmlhttpRequest を全リクエスト直列に処理する（MV3 の制約。
+  // https://github.com/Tampermonkey/tampermonkey/issues/2215 、ブラウザで 29 本が 0.76 秒おきに1本ずつ完了した）。
+  // redirect を明示すると直列化の対象から外れるが、同じ URL 同士は待たされうるので、
+  // 無視されるクエリで URL をリクエストごとに変える（公式の回避策 @require と同じ考え方）
+  let jevRequestSeq = 0;
+
+  function callJev(apiKey, body, attempt = 0) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
-        url: 'https://api.anthropic.com/v1/messages',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          // ブラウザ発（Origin ヘッダー付き）のリクエストに Anthropic が要求するオプトイン。
-          // API キーがクライアント側にあることを了解した上での利用（本スクリプトの前提どおり）
-          'anthropic-dangerous-direct-browser-access': 'true',
-          'content-type': 'application/json'
-        },
+        url: `https://api.typesafe.ai/v1/systemone?r=${++jevRequestSeq}`,
+        redirect: 'manual', // API はリダイレクトしないので追跡不要
+        headers: { 'authorization': `Bearer ${apiKey}`, 'content-type': 'application/json' },
         data: JSON.stringify(body),
         onload(res) {
           if (res.status >= 200 && res.status < 300) {
@@ -389,6 +524,93 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
             } catch (e) {
               reject(new Error('レスポンスのパースに失敗: ' + e.message));
             }
+            return;
+          }
+          // レート制限（1,200 RPM）と一時障害はバックオフして再試行する
+          if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+            const retryAfter = Number(res.responseHeaders?.match(/retry-after:\s*(\d+)/i)?.[1]);
+            const waitMs = retryAfter > 0 ? retryAfter * 1000 : 500 * 2 ** attempt;
+            setTimeout(() => callJev(apiKey, body, attempt + 1).then(resolve, reject), waitMs);
+            return;
+          }
+          let detail = res.responseText;
+          try { detail = JSON.parse(res.responseText).error?.message || detail; } catch {}
+          reject(new Error(`TypeSafe API エラー (${res.status}): ${detail}`));
+        },
+        onerror(err) {
+          reject(new Error('ネットワークエラー: ' + (err.statusText || 'unknown')));
+        }
+      });
+    });
+  }
+
+  // P(ok) 以外の合計がしきい値以上なら、ok 以外で最も確率の高いカテゴリを返す
+  function decideJevCategory(probabilities) {
+    if (!probabilities) return null;
+    if (1 - (probabilities.ok ?? 0) < JEV_THRESHOLD) return null;
+    return FILTER_CATEGORIES
+      .map(fc => fc.key)
+      .reduce((best, k) => ((probabilities[k] ?? 0) > (probabilities[best] ?? 0) ? k : best));
+  }
+
+  function callAnthropic(apiKey, messages, tools, system, opts = {}) {
+    const model = loadModel();
+    const info = getModelInfo(model);
+    // 思考するモデルは思考トークンも max_tokens に数えられるので、返答が途中で切れないよう底上げする
+    const maxTokens = opts.maxTokens ?? 4096;
+    const body = { model, max_tokens: info.thinkingByDefault ? Math.max(maxTokens, 16000) : maxTokens, messages };
+    if (tools) body.tools = tools;
+    // Opus 5.5 は tool_choice の強制が 400 になるので、auto にしてシステムプロンプトで呼び出しを指示する
+    const forceByPrompt = opts.toolChoice && info.alwaysThinking;
+    if (forceByPrompt) system = `${system}\n\n必ず ${opts.toolChoice} ツールを1回だけ呼び出して回答すること。`;
+    if (system) {
+      // cacheSystem: ツール定義+システムプロンプト（安定プレフィックス）をキャッシュする。
+      // 最低キャッシュ長はモデル依存（Haiku 4.5 は 4096 トークンで、現状のプレフィックスでは届かない）
+      body.system = opts.cacheSystem
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system;
+    }
+    // cacheConversation: 最後のキャッシュ可能ブロックに自動配置（会話履歴全体をキャッシュ）
+    if (opts.cacheConversation) body.cache_control = { type: 'ephemeral' };
+    if (opts.toolChoice) {
+      body.tool_choice = forceByPrompt ? { type: 'auto' } : { type: 'tool', name: opts.toolChoice };
+    }
+    // 分類の決定性向上用。5 世代は temperature を受け付けない（400）
+    if (opts.temperature !== undefined && !info.noSampling) body.temperature = opts.temperature;
+    if (opts.lowLatency && info.thinkingByDefault) {
+      // Sonnet 5 は思考を切って強制ツール呼び出しで高速に分類する。思考を切れないモデルは effort で浅くする
+      if (info.alwaysThinking) body.output_config = { effort: 'low' };
+      else body.thinking = { type: 'disabled' };
+    }
+    const headers = {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      // ブラウザ発（Origin ヘッダー付き）のリクエストに Anthropic が要求するオプトイン。
+      // API キーがクライアント側にあることを了解した上での利用（本スクリプトの前提どおり）
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'content-type': 'application/json'
+    };
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        headers,
+        data: JSON.stringify(body),
+        onload(res) {
+          if (res.status >= 200 && res.status < 300) {
+            let json;
+            try {
+              json = JSON.parse(res.responseText);
+            } catch (e) {
+              reject(new Error('レスポンスのパースに失敗: ' + e.message));
+              return;
+            }
+            // 安全分類器による拒否は HTTP 200 で返る（content が空になりうる）
+            if (json.stop_reason === 'refusal') {
+              reject(new Error(`モデルが応答を拒否しました（${json.stop_details?.category ?? '理由不明'}）`));
+              return;
+            }
+            resolve(json);
           } else {
             let detail = res.responseText;
             try { detail = JSON.parse(res.responseText).error?.message || detail; } catch {}
@@ -478,6 +700,7 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
 
   function callGemini(apiKey, messages, tools, system, opts = {}) {
     const model = loadModel();
+    const info = getModelInfo(model);
     const contents = convertMessagesForGemini(messages);
     const body = { contents };
     const geminiTools = convertToolsForGemini(tools);
@@ -487,11 +710,12 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       body.toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [opts.toolChoice] } };
     }
     const generationConfig = {};
-    if (opts.temperature !== undefined) generationConfig.temperature = opts.temperature;
+    // Gemini 3 は temperature を既定の 1.0 から下げるとループや性能劣化を招くため送らない
+    if (opts.temperature !== undefined && !info.noSampling) generationConfig.temperature = opts.temperature;
     if (opts.maxTokens) generationConfig.maxOutputTokens = opts.maxTokens;
-    // flash 系モデルは思考をオフにして分類を高速化（pro 系は思考オフ不可のため対象外）
-    if (opts.lowLatency && model.includes('flash')) {
-      generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    // 分類は思考を最小にして高速化（Gemini 3 は完全オフ不可。Pro は LOW が下限）
+    if (opts.lowLatency && info.lowLatencyThinking) {
+      generationConfig.thinkingConfig = { thinkingLevel: info.lowLatencyThinking };
     }
     if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
     return new Promise((resolve, reject) => {
@@ -604,9 +828,10 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     if (oaiTools) body.tools = oaiTools;
     if (opts.toolChoice) body.tool_choice = { type: 'function', function: { name: opts.toolChoice } };
     if (opts.maxTokens) body.max_completion_tokens = opts.maxTokens;
-    // gpt-5 系は temperature の変更を受け付けないため送らない。
-    // 代わりに分類では推論を浅くしてレイテンシを削る
-    if (opts.lowLatency) body.reasoning_effort = 'low';
+    // GPT-6 は temperature を送らない。Chat Completions で関数呼び出しを使えるのは
+    // reasoning_effort が none のときだけなので、ツール付きの呼び出し（分類・チャット）は none にする
+    if (oaiTools) body.reasoning_effort = 'none';
+    else if (opts.lowLatency) body.reasoning_effort = 'low';
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -1117,7 +1342,9 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     let editAnthropicKey = loadApiKeyFor('anthropic');
     let editGeminiKey = loadApiKeyFor('gemini');
     let editOpenaiKey = loadApiKeyFor('openai');
+    let editTypesafeKey = loadApiKeyFor('typesafe');
     let editModel = loadModel();
+    let editClassifier = loadClassifier();
 
     const providerNames = { anthropic: 'Claude', gemini: 'Gemini', openai: 'OpenAI' };
 
@@ -1140,6 +1367,7 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     const anthropicKeySection = makeKeySection('Anthropic API キー', editAnthropicKey, 'sk-ant-...', v => { editAnthropicKey = v; });
     const geminiKeySection = makeKeySection('Gemini API キー', editGeminiKey, 'AIza...', v => { editGeminiKey = v; });
     const openaiKeySection = makeKeySection('OpenAI API キー', editOpenaiKey, 'sk-...', v => { editOpenaiKey = v; });
+    const typesafeKeySection = makeKeySection('TypeSafe API キー（分類に Jev を使う場合）', editTypesafeKey, '', v => { editTypesafeKey = v; });
 
     const modelSection = document.createElement('div');
     modelSection.style.cssText = 'margin-bottom:20px;';
@@ -1158,6 +1386,24 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
     modelSelect.onchange = () => { editModel = modelSelect.value; };
     modelSection.append(modelLabel, modelSelect);
 
+    // 分類（コメント分析の最初の段階）だけ別モデルにできる。治安評価とチャットは上のモデルが担当する
+    const classifierSection = document.createElement('div');
+    classifierSection.style.cssText = 'margin-bottom:20px;';
+    const classifierLabel = document.createElement('label');
+    classifierLabel.style.cssText = labelStyle;
+    classifierLabel.textContent = '分類モデル';
+    const classifierSelect = document.createElement('select');
+    classifierSelect.style.cssText = inputFieldStyle + 'cursor:pointer;';
+    for (const [value, text] of [['', 'チャットと同じモデル'], ['jev', `${JEV_MODEL.label} (TypeSafe) — 高速・低コスト`]]) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = text;
+      if (value === editClassifier) opt.selected = true;
+      classifierSelect.appendChild(opt);
+    }
+    classifierSelect.onchange = () => { editClassifier = classifierSelect.value; };
+    classifierSection.append(classifierLabel, classifierSelect);
+
     const saveBtn2 = document.createElement('button');
     saveBtn2.textContent = '保存';
     saveBtn2.style.cssText = `background:${NC.azure};border:none;border-radius:4px;color:${NC.azureText};padding:8px 16px;cursor:pointer;font-size:14px;font-weight:bold;width:100%;`;
@@ -1167,12 +1413,14 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       saveApiKeyFor('anthropic', editAnthropicKey);
       saveApiKeyFor('gemini', editGeminiKey);
       saveApiKeyFor('openai', editOpenaiKey);
+      saveApiKeyFor('typesafe', editTypesafeKey);
       saveModel(editModel);
+      saveClassifier(editClassifier);
       saveBtn2.textContent = '保存しました';
       setTimeout(() => { saveBtn2.textContent = '保存'; }, 1500);
     };
 
-    settingsPanel.append(anthropicKeySection, geminiKeySection, openaiKeySection, modelSection, saveBtn2);
+    settingsPanel.append(anthropicKeySection, geminiKeySection, openaiKeySection, typesafeKeySection, modelSection, classifierSection, saveBtn2);
 
     // Usage panel
     const usagePanel = document.createElement('div');
@@ -1572,10 +1820,88 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       return metaLines.length > 0 ? `## 動画情報\n${metaLines.join('\n')}\n\n` : '';
     }
 
+    function formatEta(sec) {
+      if (sec < 60) return `約${sec}秒`;
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return s > 0 ? `約${m}分${s}秒` : `約${m}分`;
+    }
+
+    // これまでのスループット（完了チャンク/経過時間）から残り時間を推定する。
+    // 最初の完了までは推定できないので件数だけ出す。進むにつれ収束する
+    function createProgressReporter(label, total, onProgress) {
+      const startTime = Date.now();
+      let done = 0;
+      function report() {
+        if (done === 0 || done >= total) {
+          onProgress(`${label}... ${done}/${total}`);
+          return;
+        }
+        const elapsedSec = (Date.now() - startTime) / 1000;
+        const remainSec = Math.max(1, Math.ceil((elapsedSec / done) * (total - done)));
+        onProgress(`${label}... ${done}/${total}（残り${formatEta(remainSec)}）`);
+      }
+      report();
+      return () => { done++; report(); };
+    }
+
+    // Jev は1回のリクエストで全コメントに型付きの判定（確率つき）を返すので、
+    // LLM 版の2重スイープやキャッシュの温めは不要。チャンクを並列に1回流すだけ
+    async function classifyWithJev(onProgress) {
+      const apiKey = loadApiKeyFor('typesafe');
+      const meta = getVideoMetadata();
+      const verdictMap = new Map();
+      const queue = chunkForJev(uniqueComments, meta);
+      const chunkDone = createProgressReporter('分類中（Jev）', queue.length, onProgress);
+      let missing = 0;
+      // 実際に何本同時に飛んでいるかの計測（GM_xmlhttpRequest はページの Network タブに出ないため）
+      const startedAt = performance.now();
+      const timings = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+
+      async function worker() {
+        while (queue.length > 0) {
+          const chunk = queue.shift();
+          const sentAt = performance.now();
+          maxInFlight = Math.max(maxInFlight, ++inFlight);
+          const response = await callJev(apiKey, buildJevRequest(chunk, meta));
+          inFlight--;
+          const doneAt = performance.now();
+          timings.push({ 件数: chunk.length, 送信ms: Math.round(sentAt - startedAt), 完了ms: Math.round(doneAt - startedAt), 所要ms: Math.round(doneAt - sentAt) });
+          if (response.usage) recordUsage(JEV_MODEL.id, response.usage);
+          for (const c of chunk) {
+            const answer = response.answers?.[`c${c.index}`];
+            if (!answer) { missing++; continue; }
+            const cat = decideJevCategory(answer.probabilities);
+            if (cat) verdictMap.set(c.index, cat);
+          }
+          chunkDone();
+        }
+      }
+      const workers = [];
+      // worker は起動した瞬間にキューから1つ取るので、起動数は取り出す前の長さで決める
+      const workerCount = Math.min(JEV_CONCURRENCY, queue.length);
+      for (let i = 0; i < workerCount; i++) workers.push(worker());
+      await Promise.all(workers);
+      const wallMs = performance.now() - startedAt;
+      // こちらは常に JEV_CONCURRENCY 本を「送信中」にするが、GM_xmlhttpRequest の内部で順番待ちになると
+      // 所要時間が延びるだけで区別がつかない。最短の所要時間を「1本だけの処理時間」とみなし、
+      // 全体の経過時間から実際の同時処理数を推定する（直列なら 1 前後）
+      const minMs = Math.min(...timings.map(t => t.所要ms));
+      console.log(`[nicofilter] Jev: ${timings.length} リクエスト / ${(wallMs / 1000).toFixed(1)} 秒, `
+        + `送信中の最大 ${maxInFlight} 本, 最短 ${minMs}ms, 推定同時処理数 ${(timings.length * minMs / wallMs).toFixed(1)}`);
+      console.table(timings);
+      if (missing > 0) console.warn(`[nicofilter] Jev の回答が欠けたコメント: ${missing} 件（ok 扱い）`);
+      return verdictMap;
+    }
+
     // チャンク境界をずらした2本の独立スイープを同じワーカープールに同時に流し、
     // 問題判定の和集合を取る（取りこぼし対策。境界が変わると文脈のまとまりが変わるため、
     // 片方が拾い損ねたコメントをもう片方が拾える。直列の検証パスと違い待ち時間が増えない）
     async function classifyAllComments(onProgress) {
+      if (loadClassifier() === 'jev') return classifyWithJev(onProgress);
+
       // 動画情報は全チャンク共通なのでシステムプロンプト側に置き、
       // ツール定義+システムをキャッシュ可能な安定プレフィックスとして共有する
       const metaSection = buildMetaSection();
@@ -1596,29 +1922,8 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       const queue = makeChunks(0);
       if (uniqueComments.length > offset) queue.push(...makeChunks(offset));
       const total = queue.length;
-      let done = 0;
-      const startTime = Date.now();
-
-      function formatEta(sec) {
-        if (sec < 60) return `約${sec}秒`;
-        const m = Math.floor(sec / 60);
-        const s = sec % 60;
-        return s > 0 ? `約${m}分${s}秒` : `約${m}分`;
-      }
-
-      // これまでのスループット（完了チャンク/経過時間）から残り時間を推定する。
-      // ウォームアップ直後は直列分を含むため過大に出るが、進むにつれ収束する
-      function reportProgress() {
-        if (done === 0 || done >= total) {
-          onProgress(`分類中... ${done}/${total}`);
-          return;
-        }
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        const remainSec = Math.max(1, Math.ceil((elapsedSec / done) * (total - done)));
-        onProgress(`分類中... ${done}/${total}（残り${formatEta(remainSec)}）`);
-      }
-
-      reportProgress();
+      // Anthropic はウォームアップ（1本目の直列実行）を含むため、直後は残り時間が過大に出る
+      const chunkDone = createProgressReporter('分類中', total, onProgress);
 
       async function processChunk(chunk) {
         const lines = chunk.map(c => `#${c.index}\t${c.body.replace(/\s*\n\s*/g, ' ')}`).join('\n');
@@ -1646,8 +1951,7 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
             }
           }
         }
-        done++;
-        reportProgress();
+        chunkDone();
       }
 
       // Anthropic のキャッシュエントリは最初のレスポンス完了後に読めるようになるため、
@@ -1663,7 +1967,8 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
         }
       }
       const workers = [];
-      for (let i = 0; i < Math.min(CLASSIFY_CONCURRENCY, queue.length); i++) {
+      const workerCount = Math.min(CLASSIFY_CONCURRENCY, queue.length); // 起動時にキューが減る前の長さで決める
+      for (let i = 0; i < workerCount; i++) {
         workers.push(worker());
       }
       await Promise.all(workers);
@@ -1783,6 +2088,12 @@ ok とする例（境界）: 「回転！」「FND!」「真水につけろ」�
       const apiKey = loadApiKey();
       if (!apiKey) {
         addStatusBubble('APIキーを設定タブで入力してください。');
+        switchTab('settings');
+        return;
+      }
+      // Jev は分類だけを担当し、治安評価とチャットは選択中の LLM が行うので両方のキーが要る
+      if (loadClassifier() === 'jev' && !loadApiKeyFor('typesafe')) {
+        addStatusBubble('分類モデルに Jev を選んでいます。TypeSafe API キーを設定タブで入力してください。');
         switchTab('settings');
         return;
       }
