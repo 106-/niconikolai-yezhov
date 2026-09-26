@@ -29,9 +29,10 @@ AI人民委員がコメント欄の治安を守り、不適切なコメントを
 
 | プロバイダー | モデル例 | 1回あたりのコスト目安 |
 |---|---|---|
-| Anthropic (Claude) | Haiku 4.5, Sonnet 4.6, Opus 4.6 | ¥1〜10 |
-| Google (Gemini) | Flash-Lite, 3.5 Flash, 3.1 Pro | ¥0.2〜5 |
-| OpenAI (GPT) | GPT-5.4 nano/mini/5.4, GPT-5.5 | ¥0.2〜10 |
+| Anthropic (Claude) | Haiku 4.5, Sonnet 5, Opus 5.5 | ¥1〜20 |
+| Google (Gemini) | 3.5 Flash-Lite, 3.8 Flash, 3.1 Pro | ¥0.5〜10 |
+| OpenAI (GPT) | GPT-6 Luna / Sol | ¥0.2〜10 |
+| TypeSafe (Jev) | Jev 1.13（分類専用） | コメント 4,000 件で約 ¥10 |
 
 ## インストール
 
@@ -41,6 +42,7 @@ AI人民委員がコメント欄の治安を守り、不適切なコメントを
    - [Anthropic](https://console.anthropic.com/)
    - [Google AI Studio](https://aistudio.google.com/)
    - [OpenAI](https://platform.openai.com/)
+   - [TypeSafe](https://console.typesafe.ai/)（分類に Jev を使う場合のみ。上のいずれかと併用）
 
 ## 使い方
 
@@ -50,6 +52,8 @@ AI人民委員がコメント欄の治安を守り、不適切なコメントを
 2. プレイヤー右下の **漏斗アイコン** をクリック
 3. **設定タブ** で API キーを入力（使用するプロバイダーのみでOK）
 4. モデルを選択して「保存」
+   - 既定はモデル **GPT-6 Luna**、分類モデル **Jev**。この場合 OpenAI と TypeSafe の API キーが要る
+   - 分類モデルを「チャットと同じモデル」にすると、分類もチャット用モデルで行う（TypeSafe キー不要）
 
 ### コメント分析
 
@@ -88,6 +92,7 @@ AI人民委員がコメント欄の治安を守り、不適切なコメントを
 
 - **対象**: ニコニコ動画 `nvpc_next` プレイヤー
 - **LLM**: Anthropic / Google Gemini / OpenAI API + tool use (Function Calling)
+- **分類（オプション）**: TypeSafe System One API（Jev の Choice 質問、確率しきい値で判定）
 - **API通信**: `GM_xmlhttpRequest` (CORS 回避)
 - **コメント操作**: React Fiber BFS → Immer ストア + PixiJS レンダラー直接書き換え
 - **永続化**: Tampermonkey `GM_setValue` / `GM_getValue`
